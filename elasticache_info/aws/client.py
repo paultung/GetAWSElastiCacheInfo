@@ -3,7 +3,7 @@
 import logging
 import time
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
@@ -17,6 +17,9 @@ from elasticache_info.aws.exceptions import (
 )
 from elasticache_info.aws.models import ElastiCacheInfo
 from elasticache_info.field_formatter import FieldFormatter
+
+if TYPE_CHECKING:
+    from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
 
@@ -109,50 +112,58 @@ class ElastiCacheClient:
         logger.info(f"Initialized ElastiCache client for region={region}, profile={profile}")
 
     @handle_aws_errors
-    def _get_global_datastores(self) -> Dict[str, Dict[str, str]]:
+    def _get_global_datastores(self) -> Dict[str, Dict[str, Dict[str, str]]]:
         """Layer 1: Discover Global Datastores.
 
         Returns:
-            Dictionary mapping replication_group_id to Global Datastore info:
+            Dictionary mapping region -> replication_group_id -> Global Datastore info:
             {
-                "replication_group_id": {
-                    "global_datastore_id": "global-ds-name",
-                    "role": "Primary" or "Secondary"
+                "region": {
+                    "replication_group_id": {
+                        "global_datastore_id": "global-ds-name",
+                        "role": "PRIMARY" or "SECONDARY"
+                    }
                 }
             }
         """
         logger.info("Layer 1: Discovering Global Datastores")
         global_ds_map = {}
+        global_ds_ids = set()
 
         try:
+            # Get all Global Datastores with ShowMemberInfo=True to get complete Members array
+            # IMPORTANT: Without ShowMemberInfo=True, the API returns empty Members array by default
+            # This parameter is critical for cross-region Global Datastore discovery
             paginator = self.client.get_paginator("describe_global_replication_groups")
-            page_iterator = paginator.paginate()
+            page_iterator = paginator.paginate(ShowMemberInfo=True)
 
             for page in page_iterator:
                 for global_ds in page.get("GlobalReplicationGroups", []):
                     global_ds_id = global_ds.get("GlobalReplicationGroupId", "")
+                    if global_ds_id:
+                        global_ds_ids.add(global_ds_id)
+                        logger.debug(f"Found Global Datastore: {global_ds_id}")
 
-                    # Map primary member
-                    primary_rg_id = global_ds.get("GlobalNodeGroups", [{}])[0].get(
-                        "PrimaryReplicationGroupId", ""
-                    )
-                    if primary_rg_id:
-                        global_ds_map[primary_rg_id] = {
-                            "global_datastore_id": global_ds_id,
-                            "role": "Primary"
-                        }
-
-                    # Map secondary members
+                    # Parse Members array to get all regions and roles
                     for member in global_ds.get("Members", []):
                         rg_id = member.get("ReplicationGroupId", "")
+                        region = member.get("ReplicationGroupRegion", "")
                         role = member.get("Role", "")
-                        if rg_id and rg_id != primary_rg_id:
-                            global_ds_map[rg_id] = {
-                                "global_datastore_id": global_ds_id,
-                                "role": "Secondary"
-                            }
 
-            logger.info(f"Found {len(global_ds_map)} clusters in Global Datastores")
+                        if rg_id and region and role:
+                            # Initialize region dict if not exists
+                            if region not in global_ds_map:
+                                global_ds_map[region] = {}
+
+                            # Store with uppercase role for consistency
+                            global_ds_map[region][rg_id] = {
+                                "global_datastore_id": global_ds_id,
+                                "role": role.upper()
+                            }
+                            logger.debug(f"Found Global Datastore member: {rg_id} ({role}) in {region}")
+
+            total_clusters = sum(len(rg_map) for rg_map in global_ds_map.values())
+            logger.info(f"Found {total_clusters} clusters in Global Datastores across {len(global_ds_map)} regions")
         except Exception as e:
             logger.warning(f"Failed to query Global Datastores: {e}")
             # Return empty dict on failure - graceful degradation
@@ -275,10 +286,68 @@ class ElastiCacheClient:
 
         return params
 
+    def _query_single_region(
+        self,
+        region: str,
+        engines: List[str],
+        cluster_filter: Optional[str],
+        global_ds_map: Dict[str, Dict[str, Dict[str, str]]]
+    ) -> List[ElastiCacheInfo]:
+        """Query ElastiCache clusters in a single region.
+
+        Args:
+            region: AWS region to query
+            engines: List of engine types to query
+            cluster_filter: Optional wildcard pattern to filter cluster names
+            global_ds_map: Global Datastore mapping from _get_global_datastores()
+
+        Returns:
+            List of ElastiCacheInfo objects for this region
+        """
+        logger.info(f"Querying region: {region}")
+        results = []
+
+        # Query Replication Groups (Redis/Valkey)
+        if "redis" in engines or "valkey" in engines:
+            rg_engines = [e for e in engines if e in ["redis", "valkey"]]
+            replication_groups = self._get_replication_groups(rg_engines)
+
+            for rg in replication_groups:
+                rg_id = rg.get("ReplicationGroupId", "")
+
+                # Apply cluster filter
+                if cluster_filter:
+                    from elasticache_info.utils import match_wildcard
+                    if not match_wildcard(cluster_filter, rg_id):
+                        continue
+
+                info = self._convert_to_model(rg, global_ds_map, region, is_replication_group=True)
+                results.append(info)
+
+        # Query Cache Clusters (Memcached)
+        if "memcached" in engines:
+            cache_clusters = self._get_cache_clusters(["memcached"])
+
+            for cluster in cache_clusters:
+                cluster_id = cluster.get("CacheClusterId", "")
+
+                # Apply cluster filter
+                if cluster_filter:
+                    from elasticache_info.utils import match_wildcard
+                    if not match_wildcard(cluster_filter, cluster_id):
+                        continue
+
+                info = self._convert_to_model(cluster, global_ds_map, region, is_replication_group=False)
+                results.append(info)
+
+        logger.info(f"Found {len(results)} clusters in region {region}")
+        return results
+
     def _convert_to_model(
         self,
         rg_or_cluster: Dict[str, Any],
-        global_ds_map: Dict[str, Dict[str, str]],
+        global_ds_map: Dict[str, Dict[str, Dict[str, str]]],
+        current_region: str,
         is_replication_group: bool = True
     ) -> ElastiCacheInfo:
         """Convert AWS API response to ElastiCacheInfo model.
@@ -286,22 +355,28 @@ class ElastiCacheClient:
         Args:
             rg_or_cluster: Replication Group or Cache Cluster dictionary
             global_ds_map: Global Datastore mapping
+            current_region: Current region being queried
             is_replication_group: True if input is Replication Group, False if Cache Cluster
 
         Returns:
             ElastiCacheInfo object
         """
         info = ElastiCacheInfo()
-        info.region = self.region
+        info.region = current_region
 
         if is_replication_group:
             # Replication Group (Redis/Valkey)
             rg_id = rg_or_cluster.get("ReplicationGroupId", "")
 
-            # Global Datastore info
-            global_ds_info = global_ds_map.get(rg_id, {})
+            # Global Datastore info - lookup by current_region first
+            region_map = global_ds_map.get(current_region, {})
+            global_ds_info = region_map.get(rg_id, {})
             global_ds_id = global_ds_info.get("global_datastore_id")
-            info.role = global_ds_info.get("role", "")
+
+            # Format role: "PRIMARY"/"SECONDARY" -> "Primary"/"Secondary"
+            role = global_ds_info.get("role", "")
+            info.role = role.capitalize() if role else ""
+
             info.name = FieldFormatter.format_cluster_name(global_ds_id, rg_id)
 
             # Engine type, version, and maintenance window - need to get from member clusters
@@ -460,55 +535,59 @@ class ElastiCacheClient:
     def get_elasticache_info(
         self,
         engines: List[str],
-        cluster_filter: Optional[str] = None
+        cluster_filter: Optional[str] = None,
+        progress: Optional['Progress'] = None
     ) -> List[ElastiCacheInfo]:
         """Main query method to get ElastiCache information.
 
         Args:
             engines: List of engine types to query (e.g., ["redis", "valkey", "memcached"])
             cluster_filter: Optional wildcard pattern to filter cluster names
+            progress: Optional Rich Progress object for displaying query progress
 
         Returns:
             List of ElastiCacheInfo objects
         """
         logger.info(f"Starting ElastiCache query: engines={engines}, filter={cluster_filter}")
-        results = []
+        all_results = []
 
         # Layer 1: Get Global Datastore mapping
         global_ds_map = self._get_global_datastores()
 
-        # Layer 2 & 3: Query Replication Groups (Redis/Valkey)
-        if "redis" in engines or "valkey" in engines:
-            rg_engines = [e for e in engines if e in ["redis", "valkey"]]
-            replication_groups = self._get_replication_groups(rg_engines)
+        # Step 2: Identify all regions to query
+        regions_to_query = set([self.region])
+        regions_to_query.update(global_ds_map.keys())
 
-            for rg in replication_groups:
-                rg_id = rg.get("ReplicationGroupId", "")
+        logger.info(f"Regions to query: {sorted(regions_to_query)}")
 
-                # Apply cluster filter
-                if cluster_filter:
-                    from elasticache_info.utils import match_wildcard
-                    if not match_wildcard(cluster_filter, rg_id):
-                        continue
+        # Step 3: Query each region sequentially
+        for region in sorted(regions_to_query):
+            task = None
+            if progress:
+                task = progress.add_task(f"正在查詢 {region} 的 ElastiCache 叢集...", total=None)
 
-                info = self._convert_to_model(rg, global_ds_map, is_replication_group=True)
-                results.append(info)
+            try:
+                # Create region-specific client
+                region_client = ElastiCacheClient(region, self.profile)
 
-        # Layer 3: Query Cache Clusters (Memcached)
-        if "memcached" in engines:
-            cache_clusters = self._get_cache_clusters(["memcached"])
+                # Query this region
+                results = region_client._query_single_region(
+                    region, engines, cluster_filter, global_ds_map
+                )
 
-            for cluster in cache_clusters:
-                cluster_id = cluster.get("CacheClusterId", "")
+                # Add to all results
+                all_results.extend(results)
 
-                # Apply cluster filter
-                if cluster_filter:
-                    from elasticache_info.utils import match_wildcard
-                    if not match_wildcard(cluster_filter, cluster_id):
-                        continue
+                if progress and task is not None:
+                    progress.update(task, completed=True)
 
-                info = self._convert_to_model(cluster, global_ds_map, is_replication_group=False)
-                results.append(info)
+            except (AWSPermissionError, AWSConnectionError, Exception) as e:
+                logger.warning(f"{region} 查詢失敗: {e}")
+                if progress and task is not None:
+                    progress.update(task, completed=True, description=f"❌ {region} (查詢失敗)")
 
-        logger.info(f"Query completed: {len(results)} clusters found")
-        return results
+        # Step 4: Sort results by region
+        all_results.sort(key=lambda x: x.region)
+
+        logger.info(f"Query completed: {len(all_results)} clusters found across {len(regions_to_query)} regions")
+        return all_results

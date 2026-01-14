@@ -133,16 +133,16 @@ def main(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("正在查詢 ElastiCache 叢集...", total=None)
-
             try:
-                results = client.get_elasticache_info(engines=engines, cluster_filter=cluster)
+                results = client.get_elasticache_info(
+                    engines=engines,
+                    cluster_filter=cluster,
+                    progress=progress
+                )
             except AWSBaseError as e:
                 progress.stop()
                 console.print(f"[red]錯誤：{e}[/red]")
                 raise typer.Exit(1)
-
-            progress.update(task, completed=True)
 
         if not results:
             console.print("[yellow]未找到符合條件的 ElastiCache 叢集[/yellow]")
