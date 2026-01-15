@@ -257,7 +257,7 @@ The tool provides clear error messages in Chinese for common issues:
 
 ## License
 
-MIT
+Apache-2.0 license
 
 ---
 
@@ -520,4 +520,4 @@ ruff check elasticache_info tests
 
 ## 授權
 
-MIT
+Apache-2.0 license
