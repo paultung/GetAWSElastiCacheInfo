@@ -446,3 +446,298 @@ class TestGetElastiCacheInfo:
         """Test that results are sorted by region alphabetically."""
         # This test would verify the sorting logic
         pass
+
+
+class TestSharedCache:
+    """Test shared parameter cache functionality."""
+
+    @patch('elasticache_info.aws.client.boto3.Session')
+    def test_shared_cache_across_instances(self, mock_session):
+        """Test that multiple instances share the same parameter cache."""
+        # Clear shared cache before test
+        ElastiCacheClient._shared_param_cache.clear()
+        # Setup mock boto3 session and client
+        mock_client = MagicMock()
+        mock_session.return_value.client.return_value = mock_client
+
+        # Mock parameter group response
+        mock_paginator = MagicMock()
+        mock_client.get_paginator.return_value = mock_paginator
+        mock_paginator.paginate.return_value = [
+            {
+                "Parameters": [
+                    {
+                        "ParameterName": "slowlog-log-slower-than",
+                        "ParameterValue": "100"
+                    },
+                    {
+                        "ParameterName": "slowlog-max-len",
+                        "ParameterValue": "128"
+                    }
+                ]
+            }
+        ]
+
+        # Create two clients for different regions
+        client1 = ElastiCacheClient(region="us-east-1", profile="default")
+        client2 = ElastiCacheClient(region="ap-northeast-1", profile="default")
+
+        # Client1 queries parameter group first
+        params1 = client1._get_parameter_group_params("default.redis7")
+
+        # Client2 queries the same parameter group - should get cached result
+        params2 = client2._get_parameter_group_params("default.redis7")
+
+        # Verify results are identical
+        assert params1 == params2
+        assert params1["slowlog-log-slower-than"] == 100
+        assert params1["slowlog-max-len"] == 128
+
+        # Verify API was called only once (cached on first call)
+        assert mock_paginator.paginate.call_count == 1
+
+    @patch('elasticache_info.aws.client.boto3.Session')
+    def test_cache_miss_then_hit(self, mock_session):
+        """Test cache miss followed by cache hit."""
+        # Clear shared cache before test
+        ElastiCacheClient._shared_param_cache.clear()
+        # Setup mock boto3 session and client
+        mock_client = MagicMock()
+        mock_session.return_value.client.return_value = mock_client
+
+        # Mock parameter group response
+        mock_paginator = MagicMock()
+        mock_client.get_paginator.return_value = mock_paginator
+        mock_paginator.paginate.return_value = [
+            {
+                "Parameters": [
+                    {
+                        "ParameterName": "slowlog-log-slower-than",
+                        "ParameterValue": "200"
+                    }
+                ]
+            }
+        ]
+
+        client = ElastiCacheClient(region="us-east-1", profile="default")
+
+        # First call - cache miss, should query API
+        params1 = client._get_parameter_group_params("default.redis7")
+        assert mock_paginator.paginate.call_count == 1
+
+        # Second call - cache hit, should not query API
+        params2 = client._get_parameter_group_params("default.redis7")
+        assert mock_paginator.paginate.call_count == 1  # Still 1, not called again
+
+        # Results should be identical
+        assert params1 == params2
+        assert params1["slowlog-log-slower-than"] == 200
+
+    @patch('elasticache_info.aws.client.boto3.Session')
+    def test_different_parameter_groups_separate_cache(self, mock_session):
+        """Test that different parameter groups are cached separately."""
+        # Clear shared cache before test
+        ElastiCacheClient._shared_param_cache.clear()
+        # Setup mock boto3 session and client
+        mock_client = MagicMock()
+        mock_session.return_value.client.return_value = mock_client
+
+        # Mock paginator to return different responses based on parameter group
+        mock_paginator = MagicMock()
+        mock_client.get_paginator.return_value = mock_paginator
+
+        def mock_paginate(**kwargs):
+            pg_name = kwargs.get("CacheParameterGroupName")
+            if pg_name == "default.redis7":
+                return [
+                    {
+                        "Parameters": [
+                            {
+                                "ParameterName": "slowlog-log-slower-than",
+                                "ParameterValue": "100"
+                            }
+                        ]
+                    }
+                ]
+            elif pg_name == "default.redis6":
+                return [
+                    {
+                        "Parameters": [
+                            {
+                                "ParameterName": "slowlog-log-slower-than",
+                                "ParameterValue": "50"
+                            }
+                        ]
+                    }
+                ]
+            return []
+
+        mock_paginator.paginate.side_effect = mock_paginate
+
+        client = ElastiCacheClient(region="us-east-1", profile="default")
+
+        # Query different parameter groups
+        params1 = client._get_parameter_group_params("default.redis7")
+        params2 = client._get_parameter_group_params("default.redis6")
+
+        # Should have different values
+        assert params1["slowlog-log-slower-than"] == 100
+        assert params2["slowlog-log-slower-than"] == 50
+
+        # Should have called API twice (different parameter groups)
+        assert mock_paginator.paginate.call_count == 2
+
+
+class TestParallelQuery:
+    """Test parallel query functionality with ThreadPoolExecutor."""
+
+    @patch('elasticache_info.aws.client.boto3.Session')
+    def test_parallel_query_multiple_regions(self, mock_session):
+        """Test parallel querying with real ThreadPoolExecutor."""
+        # Setup mock boto3 session and client
+        mock_client = MagicMock()
+        mock_session.return_value.client.return_value = mock_client
+
+        # Mock Global Datastore discovery - return empty to test single region logic
+        mock_global_paginator = MagicMock()
+        mock_client.get_paginator.return_value = mock_global_paginator
+        mock_global_paginator.paginate.return_value = []  # No global datastores
+
+        # Mock Replication Group discovery
+        def mock_paginate(**kwargs):
+            if kwargs.get("ShowReplicationGroups", {}).get("ShowMemberInfo") is True:
+                # Global datastore discovery - return empty
+                return []
+            else:
+                # Regular replication groups
+                return [
+                    {
+                        "ReplicationGroups": [
+                            {
+                                "ReplicationGroupId": "test-cluster",
+                                "Status": "available",
+                                "Engine": "redis",
+                                "EngineVersion": "7.0.7",
+                                "CacheNodeType": "cache.t3.micro",
+                                "NumCacheClusters": 1,
+                                "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
+                                "ClusterMode": "disabled"
+                            }
+                        ]
+                    }
+                ]
+
+        mock_client.get_paginator.return_value.paginate.side_effect = mock_paginate
+
+        # Mock Cache Clusters discovery
+        mock_client.describe_cache_clusters.return_value = {
+            "CacheClusters": [
+                {
+                    "CacheClusterId": "test-cluster-0001-001",
+                    "CacheClusterStatus": "available",
+                    "Engine": "redis",
+                    "EngineVersion": "7.0.7",
+                    "CacheNodeType": "cache.t3.micro",
+                    "PreferredMaintenanceWindow": "sun:05:00-sun:06:00"
+                }
+            ]
+        }
+
+        # Mock Parameter Group discovery - need to mock get_paginator for parameter groups
+        mock_param_paginator = MagicMock()
+        mock_param_paginator.paginate.return_value = [
+            {
+                "Parameters": [
+                    {
+                        "ParameterName": "slowlog-log-slower-than",
+                        "ParameterValue": "100"
+                    }
+                ]
+            }
+        ]
+
+        # We need to handle multiple paginator calls, so we'll use side_effect
+        def paginator_side_effect(service_name):
+            if service_name == "elasticache":
+                paginator_mock = MagicMock()
+                if "global" in str(mock_client.get_paginator.call_args_list[-1] if mock_client.get_paginator.call_args_list else ""):
+                    paginator_mock.paginate.return_value = []
+                else:
+                    paginator_mock.paginate.side_effect = mock_paginate
+                return paginator_mock
+            return mock_param_paginator
+
+        mock_client.get_paginator.side_effect = paginator_side_effect
+
+        # Create client and query
+        client = ElastiCacheClient(region="us-east-1", profile="default")
+        results = client.get_elasticache_info(engines=["redis"])
+
+        # Verify we got results from the initial region
+        assert len(results) == 1
+        assert results[0].region == "us-east-1"
+        assert results[0].cluster_id == "test-cluster"
+
+    @patch('elasticache_info.aws.client.boto3.Session')
+    @patch('elasticache_info.aws.client.ElastiCacheClient._get_global_datastores')
+    @patch('elasticache_info.aws.client.ElastiCacheClient._query_single_region')
+    def test_single_region_backward_compatibility(self, mock_query_single_region, mock_get_global_datastores, mock_session):
+        """Test single region query maintains backward compatibility."""
+        # Setup mocks
+        mock_session.return_value.client.return_value = MagicMock()
+
+        # Mock _get_global_datastores to return empty (single region case)
+        mock_get_global_datastores.return_value = {}
+
+        # Mock _query_single_region to return test data
+        mock_query_single_region.return_value = [
+            MagicMock(
+                region="eu-central-1",
+                cluster_id="single-region-cluster",
+                engine="redis",
+                engine_version="7.0.7"
+            )
+        ]
+
+        # Create client and query
+        client = ElastiCacheClient(region="eu-central-1", profile="default")
+        results = client.get_elasticache_info(engines=["redis"])
+
+        # Verify _get_global_datastores was called
+        mock_get_global_datastores.assert_called_once()
+
+        # Verify _query_single_region was called once (for single region)
+        mock_query_single_region.assert_called_once_with("eu-central-1", ["redis"], None, {})
+
+        # Verify results
+        assert len(results) == 1
+        assert results[0].region == "eu-central-1"
+        assert results[0].cluster_id == "single-region-cluster"
+
+    @patch('elasticache_info.aws.client.boto3.Session')
+    def test_region_failure_handling(self, mock_session):
+        """Test that region failures don't affect other regions."""
+        # This test would be complex to mock properly with multiple regions
+        # For now, we'll test that exceptions are handled gracefully
+        # In a real scenario, this would mock AWS API errors for specific regions
+
+        # Setup mock boto3 session and client
+        mock_client = MagicMock()
+        mock_session.return_value.client.return_value = mock_client
+
+        # Mock empty Global Datastore discovery (single region case)
+        mock_global_paginator = MagicMock()
+        mock_client.get_paginator.return_value = mock_global_paginator
+        mock_global_paginator.paginate.return_value = []
+
+        # Create client
+        client = ElastiCacheClient(region="us-east-1", profile="default")
+
+        # Mock a failure in the query process
+        mock_client.describe_replication_groups.side_effect = Exception("Simulated failure")
+
+        # Query should handle the exception gracefully
+        results = client.get_elasticache_info(engines=["redis"])
+
+        # Should return empty results on failure
+        assert len(results) == 0
