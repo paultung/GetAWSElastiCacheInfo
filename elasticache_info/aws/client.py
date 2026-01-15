@@ -1,7 +1,9 @@
 """AWS ElastiCache client for querying cluster information."""
 
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -94,6 +96,11 @@ class ElastiCacheClient:
     - Layer 4: Parameter Group Queries
     """
 
+    # Class-level shared cache for parameter groups (shared across all instances)
+    # Note: Class variables are initialized once when class is defined, not per instance
+    _shared_param_cache: Dict[str, Dict[str, Optional[int]]] = {}
+    _cache_lock: threading.Lock = threading.Lock()
+
     def __init__(self, region: str, profile: str = "default"):
         """Initialize ElastiCache client.
 
@@ -103,7 +110,6 @@ class ElastiCacheClient:
         """
         self.region = region
         self.profile = profile
-        self._param_cache: Dict[str, Dict[str, str]] = {}
 
         # Initialize boto3 session with profile
         session = boto3.Session(profile_name=profile, region_name=region)
@@ -244,11 +250,13 @@ class ElastiCacheClient:
                 "slowlog-max-len": int or None
             }
         """
-        # Check cache first
-        if parameter_group_name in self._param_cache:
-            logger.debug(f"Using cached parameters for {parameter_group_name}")
-            return self._param_cache[parameter_group_name]
+        # Check cache with lock protection
+        with self._cache_lock:
+            if parameter_group_name in self._shared_param_cache:
+                logger.debug(f"Using shared cached parameters for {parameter_group_name}")
+                return self._shared_param_cache[parameter_group_name]
 
+        # Cache miss - query API (without holding lock)
         logger.debug(f"Layer 4: Querying Parameter Group: {parameter_group_name}")
         params = {
             "slowlog-log-slower-than": None,
@@ -276,9 +284,12 @@ class ElastiCacheClient:
                         except (ValueError, TypeError):
                             pass
 
-            # Cache the result
-            self._param_cache[parameter_group_name] = params
-            logger.debug(f"Cached parameters for {parameter_group_name}: {params}")
+            # Cache the result with lock protection
+            with self._cache_lock:
+                # Check again in case another thread cached it while we were querying
+                if parameter_group_name not in self._shared_param_cache:
+                    self._shared_param_cache[parameter_group_name] = params
+            logger.debug(f"Cached parameters in shared cache for {parameter_group_name}: {params}")
 
         except Exception as e:
             logger.warning(f"Failed to query Parameter Group {parameter_group_name}: {e}")
@@ -304,7 +315,7 @@ class ElastiCacheClient:
         Returns:
             List of ElastiCacheInfo objects for this region
         """
-        logger.info(f"Querying region: {region}")
+        logger.info(f"[{region}] Querying region")
         results = []
 
         # Query Replication Groups (Redis/Valkey)
@@ -340,7 +351,7 @@ class ElastiCacheClient:
                 info = self._convert_to_model(cluster, global_ds_map, region, is_replication_group=False)
                 results.append(info)
 
-        logger.info(f"Found {len(results)} clusters in region {region}")
+        logger.info(f"[{region}] Found {len(results)} clusters")
         return results
 
     def _convert_to_model(
@@ -532,6 +543,37 @@ class ElastiCacheClient:
 
         return info
 
+    def _query_region_wrapper(
+        self,
+        region: str,
+        engines: List[str],
+        cluster_filter: Optional[str],
+        global_ds_map: Dict[str, Dict[str, Dict[str, str]]]
+    ) -> List[ElastiCacheInfo]:
+        """Wrapper method for querying a single region (thread-safe).
+
+        Creates a new ElastiCacheClient instance for thread safety.
+
+        Args:
+            region: AWS region to query
+            engines: List of engine types to query
+            cluster_filter: Optional wildcard pattern to filter cluster names
+            global_ds_map: Global Datastore mapping
+
+        Returns:
+            List of ElastiCacheInfo objects for this region
+        """
+        logger.info(f"[{region}] Starting region query")
+
+        # Create region-specific client for thread safety (boto3 best practice)
+        region_client = ElastiCacheClient(region, self.profile)
+
+        # Query this region
+        results = region_client._query_single_region(region, engines, cluster_filter, global_ds_map)
+
+        logger.info(f"[{region}] Query completed, found {len(results)} clusters")
+        return results
+
     def get_elasticache_info(
         self,
         engines: List[str],
@@ -560,31 +602,38 @@ class ElastiCacheClient:
 
         logger.info(f"Regions to query: {sorted(regions_to_query)}")
 
-        # Step 3: Query each region sequentially
-        for region in sorted(regions_to_query):
-            task = None
-            if progress:
-                task = progress.add_task(f"正在查詢 {region} 的 ElastiCache 叢集...", total=None)
+        # Step 3: Query each region in parallel
+        with ThreadPoolExecutor() as executor:
+            future_to_region = {}
+            future_to_task = {}
 
-            try:
-                # Create region-specific client
-                region_client = ElastiCacheClient(region, self.profile)
+            # Submit all region queries
+            for region in sorted(regions_to_query):
+                task = None
+                if progress:
+                    task = progress.add_task(f"正在查詢 {region} 的 ElastiCache 叢集...", total=None)
 
-                # Query this region
-                results = region_client._query_single_region(
-                    region, engines, cluster_filter, global_ds_map
-                )
+                future = executor.submit(self._query_region_wrapper, region, engines, cluster_filter, global_ds_map)
+                future_to_region[future] = region
+                if task is not None:
+                    future_to_task[future] = task
 
-                # Add to all results
-                all_results.extend(results)
+            # Process completed futures
+            for future in as_completed(future_to_region):
+                region = future_to_region[future]
+                task = future_to_task.get(future)
 
-                if progress and task is not None:
-                    progress.update(task, completed=True)
+                try:
+                    results = future.result()
+                    all_results.extend(results)
 
-            except (AWSPermissionError, AWSConnectionError, Exception) as e:
-                logger.warning(f"{region} 查詢失敗: {e}")
-                if progress and task is not None:
-                    progress.update(task, completed=True, description=f"❌ {region} (查詢失敗)")
+                    if progress and task is not None:
+                        progress.update(task, completed=True)
+
+                except (AWSPermissionError, AWSConnectionError, Exception) as e:
+                    logger.warning(f"{region} 查詢失敗: {e}")
+                    if progress and task is not None:
+                        progress.update(task, completed=True, description=f"❌ {region} (查詢失敗)")
 
         # Step 4: Sort results by region
         all_results.sort(key=lambda x: x.region)
