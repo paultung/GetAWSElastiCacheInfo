@@ -258,9 +258,10 @@ class ElastiCacheClient:
 
         # Cache miss - query API (without holding lock)
         logger.debug(f"Layer 4: Querying Parameter Group: {parameter_group_name}")
+        # Initialize with Redis defaults for slow logs (enabled by default)
         params = {
-            "slowlog-log-slower-than": None,
-            "slowlog-max-len": None
+            "slowlog-log-slower-than": 10000,  # Default: 10ms (10000 microseconds)
+            "slowlog-max-len": 128  # Default: 128 entries
         }
 
         try:
@@ -272,17 +273,21 @@ class ElastiCacheClient:
                     param_name = param.get("ParameterName", "")
                     param_value = param.get("ParameterValue")
 
-                    if param_name == "slowlog-log-slower-than" and param_value:
+                    # Update if we have a non-None, non-empty-string value
+                    # Note: "0" is a valid value (means disabled), so we check for None and ""
+                    if param_name == "slowlog-log-slower-than" and param_value is not None and param_value != "":
                         try:
                             params["slowlog-log-slower-than"] = int(param_value)
-                        except (ValueError, TypeError):
-                            pass
+                            logger.debug(f"Updated slowlog-log-slower-than to {param_value}")
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Failed to parse slowlog-log-slower-than value '{param_value}': {e}")
 
-                    elif param_name == "slowlog-max-len" and param_value:
+                    elif param_name == "slowlog-max-len" and param_value is not None and param_value != "":
                         try:
                             params["slowlog-max-len"] = int(param_value)
-                        except (ValueError, TypeError):
-                            pass
+                            logger.debug(f"Updated slowlog-max-len to {param_value}")
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Failed to parse slowlog-max-len value '{param_value}': {e}")
 
             # Cache the result with lock protection
             with self._cache_lock:
@@ -476,21 +481,44 @@ class ElastiCacheClient:
             snapshot_retention = rg_or_cluster.get("SnapshotRetentionLimit")
             info.backup = FieldFormatter.format_backup(snapshot_window, snapshot_retention)
 
-            # Slow logs - query Parameter Group
-            cache_parameter_group = rg_or_cluster.get("CacheParameterGroup", {})
-            param_group_name = cache_parameter_group.get("CacheParameterGroupName")
-            if param_group_name:
-                try:
-                    params = self._get_parameter_group_params(param_group_name)
-                    info.slow_logs = FieldFormatter.format_slow_logs(
-                        params.get("slowlog-log-slower-than"),
-                        params.get("slowlog-max-len")
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to get slow log params: {e}")
-                    info.slow_logs = "Disabled"
+            # Slow logs - check if cluster has slow-log delivery enabled
+            log_delivery_configs = rg_or_cluster.get("LogDeliveryConfigurations", [])
+            slow_log_enabled = False
+            for log_config in log_delivery_configs:
+                if log_config.get("LogType") == "slow-log":
+                    dest_details = log_config.get("DestinationDetails", {})
+                    if dest_details:
+                        slow_log_enabled = True
+                        break
+
+            if slow_log_enabled:
+                # Cluster has slow-log delivery enabled, get parameter values
+                param_group_name = None
+                if cluster_detail:
+                    # Get parameter group from member cluster details
+                    cache_parameter_group = cluster_detail.get("CacheParameterGroup", {})
+                    param_group_name = cache_parameter_group.get("CacheParameterGroupName")
+                    logger.debug(f"RG {rg_id}: CacheParameterGroup = {cache_parameter_group}, param_group_name = {param_group_name}")
+
+                if param_group_name:
+                    try:
+                        params = self._get_parameter_group_params(param_group_name)
+                        info.slow_logs = FieldFormatter.format_slow_logs(
+                            params.get("slowlog-log-slower-than"),
+                            params.get("slowlog-max-len")
+                        )
+                        logger.debug(f"RG {rg_id}: Slow logs = {info.slow_logs} (from {param_group_name})")
+                    except Exception as e:
+                        logger.warning(f"Failed to get slow log params for {param_group_name}: {e}")
+                        info.slow_logs = "Enabled"  # Delivery enabled but can't get params, assume enabled
+                else:
+                    logger.debug(f"RG {rg_id}: No parameter group found but delivery enabled, assuming default")
+                    # Use default Redis slow log settings
+                    info.slow_logs = FieldFormatter.format_slow_logs(10000, 128)
             else:
+                # Cluster does not have slow-log delivery enabled
                 info.slow_logs = "Disabled"
+                logger.debug(f"RG {rg_id}: Slow logs disabled (no log delivery configuration)")
 
         else:
             # Cache Cluster (Memcached or standalone Redis)

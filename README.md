@@ -134,11 +134,22 @@ The following 18 fields are available for selection:
 11. `auto-failover` - Auto-failover (Enabled/Disabled)
 12. `encryption-transit` - Encryption in transit (Enabled/Disabled)
 13. `encryption-rest` - Encryption at rest (Enabled/Disabled)
-14. `slow-logs` - Slow logs status and parameters
+14. `slow-logs` - Slow logs status and parameters (Enabled/threshold/length or Disabled)
 15. `engine-logs` - Engine logs (Enabled/Disabled)
 16. `maintenance-window` - Maintenance window time
 17. `auto-upgrade` - Auto upgrade minor versions (Enabled/Disabled)
 18. `backup` - Backup window and retention period
+
+## Field Details
+
+### Slow Logs
+
+The `slow-logs` field displays the slow log configuration status for Redis clusters:
+
+- **Disabled**: Cluster does not have slow log delivery configured in `LogDeliveryConfigurations`
+- **Enabled/threshold/length**: Cluster has slow log delivery enabled, showing the threshold (microseconds) and max length from parameter group
+
+**Note**: The tool checks cluster-level slow log delivery configuration first, then retrieves parameter values only for enabled clusters. This ensures accurate status reporting.
 
 ## Examples
 
@@ -386,11 +397,22 @@ uv run get-aws-ec-info -r us-east-1 -v
 11. `auto-failover` - 自動故障轉移（Enabled/Disabled）
 12. `encryption-transit` - 傳輸加密（Enabled/Disabled）
 13. `encryption-rest` - 靜態加密（Enabled/Disabled）
-14. `slow-logs` - Slow logs 狀態及參數
+14. `slow-logs` - Slow logs 狀態及參數（Enabled/閾值/長度 或 Disabled）
 15. `engine-logs` - 引擎日誌（Enabled/Disabled）
 16. `maintenance-window` - 維護窗口時間
 17. `auto-upgrade` - 自動升級小版本（Enabled/Disabled）
 18. `backup` - 備份窗口及保留期
+
+## 欄位詳細說明
+
+### Slow Logs
+
+`slow-logs` 欄位顯示 Redis 叢集的 slow log 配置狀態：
+
+- **Disabled**：叢集在 `LogDeliveryConfigurations` 中沒有配置 slow log delivery
+- **Enabled/閾值/長度**：叢集已啟用 slow log delivery，顯示參數組中的閾值（微秒）和最大長度
+
+**注意**：工具會先檢查叢集層級的 slow log delivery 配置，然後只對啟用的叢集擷取參數值。這確保了狀態報告的準確性。
 
 ## 範例
 
